@@ -1,0 +1,253 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+# =========================================================
+# 0. HIGH-FREQUENCY LOTKA–VOLTERRA SYSTEM
+# =========================================================
+
+def lv_system(t, x):
+    # Parameters from the paper: a=2.2, b=1.1, c=1.1, d=3.0
+    a, b, c, d = 2.2, 1.1, 1.1, 3.0 
+    X, Y = x
+    return [a*X - b*X*Y, -c*Y + d*X*Y]
+
+t_eval = np.linspace(0, 20, 2000)
+sol = solve_ivp(lv_system, [0, 20], [1.5, 1], t_eval=t_eval)
+
+x_clean = torch.tensor(sol.y.T, dtype=torch.float32)
+
+noise = 0.05
+x_data = x_clean * (1 + noise * torch.randn_like(x_clean))
+
+# True derivatives
+dxdt_true = torch.tensor([lv_system(t, sol.y[:, i]) for i, t in enumerate(t_eval)],
+                          dtype=torch.float32)
+
+dt = t_eval[1] - t_eval[0]
+
+
+# =========================================================
+# 1. SINDy LIBRARY
+# =========================================================
+
+def library(x):
+    # Features: [1, X, Y, X^2, XY, Y^2] (Total 6 terms)
+    x1, x2 = x[:,0:1], x[:,1:2]
+    return torch.cat([
+        torch.ones_like(x1),
+        x1, x2,
+        x1*x1, x1*x2, x2*x2
+    ], dim=1)
+
+LIB_DIM = library(torch.zeros(1,2)).shape[1]
+
+
+# =========================================================
+# 2. MODELS: SINDy, ENSEMBLE, MoE-SINDy
+# =========================================================
+
+class OriginalSINDy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # xi is the sparse coefficient matrix (6x2)
+        self.xi = nn.Parameter(0.1 * torch.randn(LIB_DIM, 2)) 
+    def forward(self, x):
+        return library(x) @ self.xi
+
+
+class EnsembleSINDy(nn.Module):
+    def __init__(self, M=5):
+        super().__init__()
+        self.M = M
+        self.models = nn.ModuleList([OriginalSINDy() for _ in range(M)])
+        self.logits = nn.Parameter(torch.zeros(M))   
+    def forward(self, x):
+        preds = torch.stack([m(x) for m in self.models], dim=-1)  
+        weights = F.softmax(self.logits, dim=0)                   
+        y = (preds * weights).sum(-1)                              
+        return y
+
+class SINDyExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.xi = nn.Parameter(0.1 * torch.randn(LIB_DIM, 2))
+    def forward(self, x):
+        return library(x) @ self.xi
+
+class Gating(nn.Module):
+    def __init__(self, K):
+        super().__init__()
+        self.fc = nn.Linear(2, K)
+    def forward(self, x):
+        return F.softmax(3 * self.fc(x), dim=-1)
+
+class MoE_SINDy(nn.Module):
+    def __init__(self, K=3):
+        super().__init__()
+        self.K = K
+        self.experts = nn.ModuleList([SINDyExpert() for _ in range(K)])
+        self.gating = Gating(K)
+    def forward(self, x):
+        g = self.gating(x)  
+        expert_out = torch.stack([exp(x) for exp in self.experts], dim=-1)
+        y = (expert_out * g.unsqueeze(1)).sum(-1) 
+        return y, g, expert_out
+
+# =========================================================
+# 3. ROLLOUT + ODE SIMULATION
+# =========================================================
+
+def rollout(model, x0, steps, moe=False):
+    x = x0.clone().unsqueeze(0)
+    out = [x.squeeze(0)] 
+    for _ in range(steps):
+        dx = model(x)[0] if moe else model(x)
+        x = x + dx * dt
+        out.append(x.squeeze(0))
+    return torch.stack(out[1:]) 
+
+def simulate(model, x0, moe=False):
+    def rhs(t, x_np):
+        x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)
+        dx = model(x)[0] if moe else model(x) 
+        return dx.squeeze().detach().numpy()
+    sol = solve_ivp(rhs, [0, 20], x0.numpy(), t_eval=t_eval)
+    return sol.y.T
+
+# =========================================================
+# 4. ONE TRAINING RUN
+# =========================================================
+
+def run_once():
+    sindy = OriginalSINDy()
+    ens = EnsembleSINDy()
+    moe = MoE_SINDy()
+
+    opt_s = torch.optim.Adam(sindy.parameters(), lr=1e-3)
+    opt_e = torch.optim.Adam(ens.parameters(), lr=1e-3)
+    opt_m = torch.optim.Adam(moe.parameters(), lr=1e-3)
+
+    loss_s_hist = []
+    loss_e_hist = []
+    loss_m_hist = []
+    
+    ITERS_SINDY = 20000
+    ITERS_ENSEMBLE = 20000
+    ITERS_MOE = 20000
+    RECORD_STEP = 10
+    
+    # --- SINDy Training ---
+    for i in range(ITERS_SINDY):
+        loss_local = torch.mean((sindy(x_data) - dxdt_true)**2)
+        opt_s.zero_grad(); loss_local.backward(); opt_s.step()
+        if i % RECORD_STEP == 0:
+            loss_s_hist.append(loss_local.item())
+
+    # --- Ensemble SINDy Training ---
+    for i in range(ITERS_ENSEMBLE):
+        loss_local = torch.mean((ens(x_data) - dxdt_true)**2)
+        opt_e.zero_grad(); loss_local.backward(); opt_e.step()
+        if i % RECORD_STEP == 0:
+            loss_e_hist.append(loss_local.item())
+
+    # --- MoE-SINDy Training (with regularization) ---
+    LAMBDA_ROLLOUT = 0.3
+    LAMBDA_ORTH = 1e-3
+    LAMBDA_ENTROPY = 1e-4
+
+    for i in range(ITERS_MOE):
+        dx, g, exp_out = moe(x_data)
+
+        loss_local = torch.mean((dx - dxdt_true)**2)
+
+        # Rollout Loss
+        rollout_loss = 0
+        for idx in range(0, 1800, 80): 
+            r_true = x_data[idx:idx+15] 
+            r_m = rollout(moe, x_data[idx], 15, moe=True) 
+            rollout_loss += torch.mean((r_m - r_true)**2) 
+
+        # Orthogonality Loss
+        orth = 0
+        for k1 in range(moe.K):
+            for k2 in range(k1+1, moe.K):
+                orth += torch.norm(moe.experts[k1].xi.T @ moe.experts[k2].xi) 
+
+        # Entropy Loss
+        entropy = -torch.mean(torch.sum(g * torch.log(g + 1e-8), dim=1)) 
+
+        # Final Composite Loss
+        loss = loss_local + LAMBDA_ROLLOUT*rollout_loss + LAMBDA_ORTH*orth + LAMBDA_ENTROPY*entropy 
+
+        opt_m.zero_grad(); loss.backward(); opt_m.step()
+        
+        if i % RECORD_STEP == 0:
+            loss_m_hist.append(loss_local.item()) 
+
+    # --- Final Trajectory Prediction and MSE Calculation ---
+    sindy_pred = simulate(sindy, x_clean[0])
+    ensemble_pred = simulate(ens, x_clean[0])
+    moe_pred = simulate(moe, x_clean[0], moe=True)
+
+# Rollout MSE 
+    min_len = min(sindy_pred.shape[0], ensemble_pred.shape[0], moe_pred.shape[0], x_clean.shape[0])
+    x_clean_cropped = x_clean.numpy()[:min_len]
+
+    roll_sindy = np.mean((sindy_pred[:min_len] - x_clean_cropped)**2)
+    roll_ens = np.mean((ensemble_pred[:min_len] - x_clean_cropped)**2)
+    roll_moe = np.mean((moe_pred[:min_len] - x_clean_cropped)**2)
+
+    # Local MSE
+    local_sindy = torch.mean((sindy(x_data)-dxdt_true)**2).item()
+    local_ens  = torch.mean((ens(x_data)-dxdt_true)**2).item()
+    dx, _, _ = moe(x_data) 
+    local_moe  = torch.mean((dx - dxdt_true)**2).item()
+
+    return (local_sindy, local_ens, local_moe,
+            roll_sindy, roll_ens, roll_moe,
+            loss_s_hist, loss_e_hist, loss_m_hist,
+            ITERS_SINDY, ITERS_ENSEMBLE, ITERS_MOE, RECORD_STEP)
+
+
+# =========================================================
+# 5. EXECUTION AND PLOTTING
+# =========================================================
+
+(local_sindy, local_ens, local_moe,
+ roll_sindy, roll_ens, roll_moe,
+ loss_s_hist, loss_e_hist, loss_m_hist,
+ ITERS_SINDY, ITERS_ENSEMBLE, ITERS_MOE, RECORD_STEP) = run_once()
+
+# Print Final Results
+print("\n===== FINAL RESULTS (3% NOISE) =====")
+print(f"  SINDy Local MSE:    {local_sindy:.6f}")
+print(f"  Ensemble Local MSE: {local_ens:.6f}")
+print(f"  MoE Local MSE:      {local_moe:.6f}")
+print(f"  SINDy Rollout MSE:  {roll_sindy:.6f}")
+print(f"  Ensemble Rollout MSE: {roll_ens:.6f}")
+print(f"  MoE Rollout MSE:    {roll_moe:.6f}")
+
+
+# Plot Convergence
+plt.figure(figsize=(10, 5))
+
+sindy_iters = np.arange(0, ITERS_SINDY, RECORD_STEP)
+plt.plot(sindy_iters[:len(loss_s_hist)], loss_s_hist, label="SINDy Local MSE", linewidth=1.5)
+
+ensemble_iters = np.arange(0, ITERS_ENSEMBLE, RECORD_STEP)
+plt.plot(ensemble_iters[:len(loss_e_hist)], loss_e_hist, label="Ensemble Local MSE", linewidth=1.5)
+
+moe_iters = np.arange(0, ITERS_MOE, RECORD_STEP)
+plt.plot(moe_iters[:len(loss_m_hist)], loss_m_hist, label="MoE-SINDy Local MSE", linewidth=1.5)
+
+plt.xlabel("Training Iterations")
+plt.ylabel("Local Derivative MSE")
+plt.title("Model Convergence: Local Loss over Training Steps")
+plt.yscale('log')
+plt.legend()
+plt.grid(True, which="both", ls="--")
+plt.show()
